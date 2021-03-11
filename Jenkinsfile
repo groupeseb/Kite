@@ -1,104 +1,131 @@
-node('java') {
-    def isPRBuild
-    try {
-        stage('Checkout') {
-            // configure old builds retention
-            /* Only keep the 2 most recent builds on branches, and 5 last builds on master. */
-            def numToKeepStr
-            if (BRANCH_NAME == 'master' || BRANCH_NAME.startsWith("mep_")) {
-                numToKeepStr = '5'
-            } else {
-                numToKeepStr = '2'
-            }
-            properties([[$class  : 'BuildDiscarderProperty',
-                         strategy: [$class: 'LogRotator', numToKeepStr: "${numToKeepStr}"]]])
+// Syntax: https://www.jenkins.io/doc/book/pipeline/syntax/
 
-            // Checkout code from repository
-            checkout scm
-        }
+pipeline {
 
-        stage('Prepare') {
-            // Check if the current build concerns a PR or a branch
-            try {
-                def prNumber = CHANGE_ID
-                // the CHANGE_ID environment variable exists: we are building a PR
-                isPRBuild = true
-            } catch (MissingPropertyException e) {
-                // we are building a branch and not a PR
-                isPRBuild = false
-            }
+  agent {
+    label 'java8'
+  }
 
-        }
+  environment {
+    JAVA_HOME = "${tool 'JDK-1.8u111'}"
+    PATH = "${env.JAVA_HOME}/bin:${env.PATH}"
+  }
 
-        stage('Build') {
-            // Get the JDK7 to build
-            env.JAVA_HOME = "${tool 'JDK-1.7u121'}"
-            env.PATH = "${env.JAVA_HOME}/bin:${env.PATH}"
+  options {
+    skipDefaultCheckout()
+    buildDiscarder(
+      logRotator(
+        artifactDaysToKeepStr: '30',
+        artifactNumToKeepStr: '2',
+        daysToKeepStr: '',
+        numToKeepStr: '5'
+      )
+    )
+    parallelsAlwaysFailFast()
+  }
 
-            // choose maven goal using the branch : only snapshot from Master are deployed
-            def mvnGoal
-            if (BRANCH_NAME == 'master') {
-                mvnGoal = "deploy"
-            } else {
-                mvnGoal = "install"
-            }
-
-            // Run the maven build, in a try/finally to ensure tests reports are published even if maven tests failed
-            withMaven(
-                    maven: 'Maven3',
-                    mavenSettingsConfig: 'seb-nexus-aws-config') {
-
-                sh "mvn clean ${mvnGoal} -V -Dmaven.test.failure.ignore=true"
-            }
-            // publish test results
-            junit '**/target/*-reports/*.xml'
-        }
-
-        stage('Code analysis') {
-            // use JDK8 to run Sonar, since JDK7 support has been dropped down
-            env.JAVA_HOME = "${tool 'JDK-1.8u111'}"
-            env.PATH = "${env.JAVA_HOME}/bin:${env.PATH}"
-
-            // If some classes/packages need to be excluded, add them here separated by a comma
-            // Each exclusion must be justified
-            def sonarExclusions = ""
-            def sonarQubeCommonArgs = "-Dsonar.java.source=7 -Dsonar.sources=src -Dsonar.java.binaries=target/classes,target/test-classes -Dsonar.java.libraries=target/dependency -Dsonar.exclusions=${sonarExclusions}"
-            def scannerHome = tool 'SonarQube Scanner AWS';
-            def sonarQubePRArguments = ""
-            if (isPRBuild) {
-                echo "Building a change request : running SonarQube analysis in preview mode."
-                withCredentials([string(credentialsId: 'github-sonar-api-token', variable: 'GITHUB_TOKEN')]) {
-                    // The preview mode allows not to override the master analysis (results are separated from the main project)
-                    // OAuth token is generated through GitHub: https://help.github.com/articles/creating-a-personal-access-token-for-the-command-line/
-                    sonarQubePRArguments = " -Dsonar.analysis.mode=preview -Dsonar.github.oauth=${GITHUB_TOKEN} -Dsonar.github.repository=groupeseb/Kite -Dsonar.github.pullRequest=" + CHANGE_ID
-                }
-            }
-
-            def pom = readMavenPom file: 'pom.xml'
-
-            withSonarQubeEnv('SonarQube AWS') {
-                sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=KITE -Dsonar.projectVersion=${pom.version} ${sonarQubeCommonArgs} ${sonarQubePRArguments}"
-            }
-        }
-    } finally {
-        // the notify stage is in a finally block to be executed even if the build failed
-        stage('Notify') {
-            // if the build status is null, then the build is successfull
-            def buildStatus = currentBuild.result ?: "SUCCESS"
-
-            if (isPRBuild) {
-                echo "Building a change request : not sending emails."
-            } else {
-                // we are not in a PR : sending emails if the build is failed or unstable
-                if (buildStatus != "SUCCESS") {
-                    emailext(
-                            subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - ${buildStatus}!",
-                            body: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - ${buildStatus}:\n\nCheck console output at ${env.BUILD_URL} to view the results.",
-                            to: "FctIs-DCPBackTeam@groupeseb.com"
-                    )
-                }
-            }
-        }
+  stages {
+    stage('Checkout') {
+      steps {
+        cleanWs()
+        checkout(scm)
+      }
     }
 
+    stage('Build') {
+      when {
+        changeRequest()
+      }
+      steps {
+        withMaven(
+          maven: 'Maven3',
+          mavenSettingsConfig: 'seb-nexus-aws-config'
+        ) {
+          sh """
+            mvn install \
+                -V \
+                -Dmaven.test.failure.ignore=true
+          """
+        }
+
+        junit '**/target/*-reports/*.xml'
+      }
+    }
+
+    stage('Code Analysis') {
+      when {
+        changeRequest()
+      }
+      environment {
+        // Key visible in SonarQube dashboard
+        JAVA_HOME           = "${tool 'JDK-11'}"
+        PATH                = "${env.JAVA_HOME}/bin:${env.PATH}"
+        REPO_NAME           = 'Kite'
+        PROJECT             = "KITE"
+        EXCLUSIONS          = "''"
+        COVERAGE_EXCLUSIONS = "''"
+        SCANNER_HOME        = "${tool 'SonarQube Scanner AWS'}"
+        VERSION             = "${readMavenPom().getVersion()}"
+      }
+      steps {
+        withSonarQubeEnv('SonarQube AWS') {
+          sh """
+            ${SCANNER_HOME}/bin/sonar-scanner \
+              -Dsonar.scm.provider=git \
+              -Dsonar.projectKey=${PROJECT} \
+              -Dsonar.projectVersion=${VERSION} \
+              -Dsonar.java.source=8 \
+              -Dsonar.sources=src/main/java \
+              -Dsonar.tests=src/test/java \
+              -Dsonar.java.binaries=target/classes \
+              -Dsonar.java.libraries=target/dependency \
+              -Dsonar.exclusions=${EXCLUSIONS} \
+              -Dsonar.coverage.exclusions=${COVERAGE_EXCLUSIONS} \
+              -Dsonar.dependencyCheck.reportPath=target/dependency-check-report.xml \
+              -Dsonar.dependencyCheck.htmlReportPath=target/dependency-check-report.html \
+              -Dsonar.pullrequest.key=${CHANGE_ID} \
+              -Dsonar.pullrequest.branch=${CHANGE_BRANCH} \
+              -Dsonar.pullrequest.base=${CHANGE_TARGET} \
+              -Dsonar.pullrequest.github.repository=groupeseb/${REPO_NAME} \
+              -Dsonar.pullrequest.github.endpoint=https://api.github.com/ \
+              -Dsonar.pullrequest.provider=GitHub
+          """
+        }
+      }
+    }
+
+    stage('Release') {
+      when {
+        buildingTag()
+      }
+      steps {
+        sh "mkdir ${WORKSPACE}/.m2"
+        withMaven(
+          maven: 'Maven3',
+          mavenSettingsConfig: 'seb-nexus-aws-config',
+          mavenLocalRepo: "${WORKSPACE}/.m2"
+        ) {
+          sh """
+            mvn --batch-mode clean
+
+            mvn --batch-mode dependency:purge-local-repository
+
+            mvn --batch-mode versions:set \
+                -DnewVersion="${TAG_NAME.substring(1)}"
+
+            mvn --batch-mode deploy \
+                -DskipTests \
+                -Dskip.it.tests=true \
+                -PspecialReleaseProfile \
+                -PspecialRelease
+          """
+        }
+      }
+    }
+  }
+  post {
+    cleanup {
+      cleanWs()
+    }
+  }
 }
